@@ -1,0 +1,910 @@
+File: ./deploy-commands.js
+--------------------------------------------------------------------------------
+require('dotenv').config();
+const { REST, Routes } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
+
+const commands = [];
+const commandsPath = path.join(__dirname, 'src', 'commands');
+const commandCategories = fs.readdirSync(commandsPath);
+
+for (const category of commandCategories) {
+  const categoryPath = path.join(commandsPath, category);
+  const commandFiles = fs
+    .readdirSync(categoryPath)
+    .filter((file) => file.endsWith('.js'));
+
+  for (const file of commandFiles) {
+    const command = require(path.join(categoryPath, file));
+    if ('data' in command) {
+      commands.push(command.data.toJSON());
+    } else {
+      console.warn(`The command at ${file} is missing a "data" property.`);
+    }
+  }
+}
+
+const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
+
+(async () => {
+  try {
+    console.log(`Started refreshing application commands for guild ID ${process.env.TEST_GUILD_ID}.`);
+
+    const data = await rest.put(
+      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.TEST_GUILD_ID),
+      { body: commands },
+    );
+
+    console.log(`Successfully reloaded ${data.length} application commands for guild.`);
+  } catch (error) {
+    console.error(error);
+  }
+})();
+--------------------------------------------------------------------------------
+
+File: ./Dockerfile
+--------------------------------------------------------------------------------
+# Use the official Node.js LTS (Long Term Support) image
+FROM node:18
+
+# Install build dependencies for @napi-rs/canvas
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libjpeg-dev \
+    libgif-dev \
+    librsvg2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Copy package.json and package-lock.json first for better caching
+COPY package*.json ./
+
+# Clean npm cache to prevent potential conflicts
+RUN npm cache clean --force
+
+# Install nodemon globally
+RUN npm install -g nodemon
+
+# Install all dependencies, forcing a build from source for native modules
+RUN npm install --build-from-source
+
+# Copy the rest of the application code
+COPY . .
+
+
+# Run the deploy-commands script to register Discord commands
+# Note: It's better to run this as a separate step, but included here for automation
+# RUN node deploy-commands.js
+
+# Start the bot using nodemon
+CMD ["nodemon", "src/index.js"]
+--------------------------------------------------------------------------------
+
+File: ./config.json
+--------------------------------------------------------------------------------
+{
+    "devs": ["689283909166563461"],
+    "testServer": "783496446677614623"
+  }
+  --------------------------------------------------------------------------------
+
+File: ./prompt.txt
+--------------------------------------------------------------------------------
+Check the current files --------------------------------------------------------------------------------
+
+File: ./.dockerignore
+--------------------------------------------------------------------------------
+node_modules
+npm-debug.log
+Dockerfile
+docker-compose.yml
+.env
+--------------------------------------------------------------------------------
+
+File: ./package.json
+--------------------------------------------------------------------------------
+{
+  "name": "discordbot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "deploy-commands": "node deploy-commands.js"
+  },
+  "dependencies": {
+    "canvacord": "^5.2.1",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "mongoose": "^7.3.1",
+    "ms": "^2.1.3",
+    "pretty-ms": "^9.2.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
+--------------------------------------------------------------------------------
+
+File: ./docker-compose.yml
+--------------------------------------------------------------------------------
+version: '3'
+
+services:
+  discordbot:
+    build: .
+    container_name: discordbot
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - mongodb
+    volumes:
+      - .:/app
+      - /app/node_modules # Ensures container's node_modules aren't overwritten by host
+    networks:
+      - botnet
+
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb
+    restart: always
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - botnet
+
+volumes:
+  mongodb_data:
+
+networks:
+  botnet:
+--------------------------------------------------------------------------------
+
+File: ./src/index.js
+--------------------------------------------------------------------------------
+require('dotenv').config();
+const { Client, IntentsBitField } = require('discord.js');
+const mongoose = require('mongoose');
+const eventHandler = require('./handlers/eventHandler');
+
+mongoose.set('strictQuery', false);
+
+const client = new Client({
+  intents: [
+    IntentsBitField.Flags.Guilds,
+    IntentsBitField.Flags.GuildMembers,
+    IntentsBitField.Flags.GuildMessages,
+    IntentsBitField.Flags.MessageContent,
+    IntentsBitField.Flags.GuildPresences,
+  ],
+});
+
+(async () => {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI, { 
+      useNewUrlParser: true,
+      useUnifiedTopology: true
+    });
+    console.log('Connected to MongoDB');
+
+    eventHandler(client);
+
+    client.login(process.env.TOKEN);
+  } catch (error) {
+    console.error('Error connecting to MongoDB:', error);
+  }
+})();
+
+--------------------------------------------------------------------------------
+
+File: ./src/utils/calculateLevelXP.js
+--------------------------------------------------------------------------------
+module.exports = (level) => {
+    return 100 * (level || 1);
+  };
+  --------------------------------------------------------------------------------
+
+File: ./src/utils/getLocalCommands.js
+--------------------------------------------------------------------------------
+const path = require('path');
+const getAllFiles = require('./getAllFiles');
+
+module.exports = function getLocalCommands(exceptions = []) {
+  const localCommands = [];
+
+  const commandCategories = getAllFiles(
+    path.join(__dirname, '..', 'commands'),
+    true
+  );
+
+  for (const category of commandCategories) {
+    const commandFiles = getAllFiles(category);
+
+    for (const commandFile of commandFiles) {
+      const commandObject = require(commandFile);
+      if (exceptions.includes(commandObject.name)) {
+        continue;
+      }
+      localCommands.push(commandObject);
+    }
+  }
+  return localCommands;
+};
+--------------------------------------------------------------------------------
+
+File: ./src/utils/getAllFiles.js
+--------------------------------------------------------------------------------
+const fs = require('fs');
+const path = require('path');
+
+module.exports = function getAllFiles(directory, foldersOnly = false) {
+  let fileNames = [];
+  const files = fs.readdirSync(directory, { withFileTypes: true });
+
+  for (const file of files) {
+    const filePath = path.join(directory, file.name);
+    if (foldersOnly) {
+      if (file.isDirectory()) {
+        fileNames.push(filePath);
+      }
+    } else if (file.isFile()) {
+      fileNames.push(filePath);
+    } else if (file.isDirectory()) {
+      fileNames = fileNames.concat(getAllFiles(filePath, foldersOnly));
+    }
+  }
+  return fileNames;
+};
+--------------------------------------------------------------------------------
+
+File: ./src/models/user.js
+--------------------------------------------------------------------------------
+const { Schema, model } = require('mongoose');
+
+const userSchema = new Schema({
+  userId: { type: String, required: true },
+  guildId: { type: String, required: true },
+  balance: { type: Number, default: 0 },
+  lastDaily: { type: Date, default: new Date(0) }, // Default to epoch
+});
+
+module.exports = model('User', userSchema);
+--------------------------------------------------------------------------------
+
+File: ./src/models/level.js
+--------------------------------------------------------------------------------
+const { Schema, model } = require('mongoose');
+
+const levelSchema = new Schema({
+  userId: { type: String, required: true },
+  guildId: { type: String, required: true },
+  xp: { type: Number, default: 0 },
+  level: { type: Number, default: 1 },
+});
+
+module.exports = model('Level', levelSchema);
+--------------------------------------------------------------------------------
+
+File: ./src/commands/misc/add.js
+--------------------------------------------------------------------------------
+const { ApplicationCommandOptionType } = require('discord.js');
+
+module.exports = {
+  name: 'add',
+  description: 'Adds two numbers together',
+  options: [
+    {
+      name: 'num1',
+      description: 'The first number',
+      type: ApplicationCommandOptionType.Number,
+      required: true,
+    },
+    {
+      name: 'num2',
+      description: 'The second number',
+      type: ApplicationCommandOptionType.Number,
+      required: true,
+    },
+  ],
+  callback: (client, interaction) => {
+    const num1 = interaction.options.getNumber('num1');
+    const num2 = interaction.options.getNumber('num2');
+    interaction.reply(`The sum is ${num1 + num2}`);
+  },
+};
+--------------------------------------------------------------------------------
+
+File: ./src/commands/misc/ping.js
+--------------------------------------------------------------------------------
+module.exports = {
+    name: 'ping',
+    description: 'Replies with the bot ping!',
+    callback: async (client, interaction) => {
+      await interaction.deferReply();
+  
+      const reply = await interaction.fetchReply();
+  
+      const ping = reply.createdTimestamp - interaction.createdTimestamp;
+  
+      interaction.editReply(
+        `Pong! Client ${ping}ms | Websocket: ${client.ws.ping}ms`
+      );
+    },
+  };
+  --------------------------------------------------------------------------------
+
+File: ./src/commands/misc/hey.js
+--------------------------------------------------------------------------------
+module.exports = {
+    name: 'hey',
+    description: 'Replies with Hey!',
+    callback: (client, interaction) => {
+      interaction.reply('Hey!');
+    },
+  };
+  --------------------------------------------------------------------------------
+
+File: ./src/commands/economy/daily.js
+--------------------------------------------------------------------------------
+const User = require('../../models/user');
+
+module.exports = {
+  name: 'daily',
+  description: 'Collect your daily reward.',
+  callback: async (client, interaction) => {
+    if (!interaction.inGuild()) {
+      return interaction.reply({ content: 'You can only use this command inside a server.', ephemeral: true });
+    }
+
+    const DAILY_AMOUNT = 1000;
+
+    try {
+      await interaction.deferReply({ ephemeral: true });
+
+      const query = { userId: interaction.member.id, guildId: interaction.guild.id };
+      let user = await User.findOne(query);
+
+      if (user) {
+        const lastDailyDate = user.lastDaily.toDateString();
+        const currentDate = new Date().toDateString();
+
+        if (lastDailyDate === currentDate) {
+          return interaction.editReply('You have already collected your daily reward today. Come back tomorrow.');
+        }
+
+        user.balance += DAILY_AMOUNT;
+        user.lastDaily = new Date();
+      } else {
+        user = new User({
+          ...query,
+          balance: DAILY_AMOUNT,
+          lastDaily: new Date(),
+        });
+      }
+
+      await user.save();
+
+      interaction.editReply(`$${DAILY_AMOUNT} was added to your balance. Your new balance is $${user.balance}.`);
+    } catch (error) {
+      console.error('Error with daily command:', error);
+      interaction.editReply('An error occurred while processing your request. Please try again later.');
+    }
+  },
+};
+--------------------------------------------------------------------------------
+
+File: ./src/commands/economy/level.js
+--------------------------------------------------------------------------------
+const { ApplicationCommandOptionType, AttachmentBuilder, IntentsBitField } = require('discord.js');
+const canvacord = require('canvacord');
+const Level = require('../../models/level');
+const calculateLevelXP = require('../../utils/calculateLevelXP');
+
+module.exports = {
+  name: 'level',
+  description: 'Displays your or someone else\'s level.',
+  options: [
+    {
+      name: 'target_user',
+      description: 'The user whose level you want to see',
+      type: ApplicationCommandOptionType.User,
+      required: false,
+    },
+  ],
+  callback: async (client, interaction) => {
+    if (!interaction.inGuild()) {
+      return interaction.reply('You can only use this command inside a server.');
+    }
+
+    await interaction.deferReply();
+
+    const targetUser = interaction.options.getUser('target_user') || interaction.user;
+
+    const targetMember = await interaction.guild.members.fetch(targetUser.id);
+
+    const fetchedLevel = await Level.findOne({
+      userId: targetUser.id,
+      guildId: interaction.guild.id,
+    });
+
+    if (!fetchedLevel) {
+      return interaction.editReply(
+        targetUser.id === interaction.user.id
+          ? 'You don\'t have any levels yet.'
+          : `${targetUser.tag} doesn't have any levels yet.`
+      );
+    }
+
+    const allLevels = await Level.find({ guildId: interaction.guild.id })
+      .select('-_id userId level xp')
+      .sort({ level: -1, xp: -1 });
+
+    const currentRank =
+      allLevels.findIndex((level) => level.userId === targetUser.id) + 1;
+
+    const rankCard = new canvacord.Rank()
+      .setAvatar(targetUser.displayAvatarURL({ format: 'png', size: 256 }))
+      .setRank(currentRank)
+      .setLevel(fetchedLevel.level)
+      .setCurrentXP(fetchedLevel.xp)
+      .setRequiredXP(calculateLevelXP(fetchedLevel.level))
+      .setStatus(targetMember.presence?.status || 'offline')
+      .setProgressBar('#FF0000', 'COLOR')
+      .setUsername(targetUser.username)
+      .setDiscriminator(targetUser.discriminator);
+
+    const data = await rankCard.build();
+    const attachment = new AttachmentBuilder(data, { name: 'rank.png' });
+
+    interaction.editReply({ files: [attachment] });
+  },
+};
+--------------------------------------------------------------------------------
+
+File: ./src/commands/moderation/timeout.js
+--------------------------------------------------------------------------------
+const {
+    ApplicationCommandOptionType,
+    PermissionFlagsBits,
+  } = require('discord.js');
+  const ms = require('ms');
+  (async () => {
+    const prettyMs = await import('pretty-ms');
+    // Tu lógica con prettyMs aquí
+  })();
+  
+  
+  module.exports = {
+    name: 'timeout',
+    description: 'Timeout a user for a specified duration.',
+    options: [
+      {
+        name: 'target',
+        description: 'The user to timeout',
+        type: ApplicationCommandOptionType.User,
+        required: true,
+      },
+      {
+        name: 'duration',
+        description: 'Duration of the timeout (e.g., 10m, 1h, 1d)',
+        type: ApplicationCommandOptionType.String,
+        required: true,
+      },
+      {
+        name: 'reason',
+        description: 'Reason for the timeout',
+        type: ApplicationCommandOptionType.String,
+        required: false,
+      },
+    ],
+    permissionsRequired: [PermissionFlagsBits.ModerateMembers.valueOf()],
+    botPermissions: [PermissionFlagsBits.ModerateMembers.valueOf()],
+    callback: async (client, interaction) => {
+      const targetUser = interaction.options.getUser('target');
+      const durationInput = interaction.options.getString('duration');
+      const reason =
+        interaction.options.getString('reason') || 'No reason provided';
+  
+      await interaction.deferReply();
+  
+      const targetMember = await interaction.guild.members
+        .fetch(targetUser.id)
+        .catch(() => null);
+  
+      if (!targetMember) {
+        return interaction.editReply(
+          'That user does not exist in this server.'
+        );
+      }
+  
+      if (targetMember.user.bot) {
+        return interaction.editReply('You cannot timeout a bot.');
+      }
+  
+      const msDuration = ms(durationInput);
+      if (
+        !msDuration ||
+        msDuration < 5000 ||
+        msDuration > 28 * 24 * 60 * 60 * 1000
+      ) {
+        return interaction.editReply(
+          'Invalid duration. Must be between 5 seconds and 28 days.'
+        );
+      }
+  
+      const targetRolePosition = targetMember.roles.highest.position;
+      const requestorRolePosition = interaction.member.roles.highest.position;
+      const botRolePosition = interaction.guild.members.me.roles.highest.position;
+  
+      if (targetRolePosition >= requestorRolePosition) {
+        return interaction.editReply(
+          'You cannot timeout this user as they have a higher or equal role.'
+        );
+      }
+  
+      if (targetRolePosition >= botRolePosition) {
+        return interaction.editReply(
+          'I cannot timeout this user as they have a higher or equal role.'
+        );
+      }
+  
+      try {
+        const formattedDuration = prettyMs(msDuration, { verbose: true });
+        await targetMember.timeout(msDuration, reason);
+  
+        interaction.editReply(
+          `${targetUser.tag} was timed out for ${formattedDuration}.\nReason: ${reason}`
+        );
+      } catch (error) {
+        console.error('Error timing out user:', error);
+        interaction.editReply('There was an error executing the timeout command.');
+      }
+    },
+  };
+  --------------------------------------------------------------------------------
+
+File: ./src/commands/moderation/kick.js
+--------------------------------------------------------------------------------
+const {
+    ApplicationCommandOptionType,
+    PermissionFlagsBits,
+  } = require('discord.js');
+  
+  module.exports = {
+    name: 'kick',
+    description: 'Kicks a member from this server',
+    options: [
+      {
+        name: 'target',
+        description: 'The user you want to kick',
+        type: ApplicationCommandOptionType.User,
+        required: true,
+      },
+      {
+        name: 'reason',
+        description: 'Reason for kicking',
+        type: ApplicationCommandOptionType.String,
+        required: false,
+      },
+    ],
+    permissionsRequired: [PermissionFlagsBits.KickMembers.valueOf()],
+    botPermissions: [PermissionFlagsBits.KickMembers.valueOf()],
+    callback: async (client, interaction) => {
+      const targetUser = interaction.options.getUser('target');
+      const reason =
+        interaction.options.getString('reason') || 'No reason provided';
+  
+      await interaction.deferReply();
+  
+      const targetMember = await interaction.guild.members
+        .fetch(targetUser.id)
+        .catch(() => null);
+  
+      if (!targetMember) {
+        return interaction.editReply(
+          'That user does not exist in this server.'
+        );
+      }
+  
+      if (targetMember.id === interaction.guild.ownerId) {
+        return interaction.editReply('You cannot kick the server owner.');
+      }
+  
+      const targetRolePosition = targetMember.roles.highest.position;
+      const requestorRolePosition = interaction.member.roles.highest.position;
+      const botRolePosition = interaction.guild.members.me.roles.highest.position;
+  
+      if (targetRolePosition >= requestorRolePosition) {
+        return interaction.editReply(
+          'You cannot kick this user as they have a higher or equal role.'
+        );
+      }
+  
+      if (targetRolePosition >= botRolePosition) {
+        return interaction.editReply(
+          'I cannot kick this user as they have a higher or equal role.'
+        );
+      }
+  
+      try {
+        await targetMember.kick(reason);
+        interaction.editReply(
+          `User ${targetUser.tag} was kicked. Reason: ${reason}`
+        );
+      } catch (error) {
+        console.error('Error kicking user:', error);
+        interaction.editReply('There was an error kicking this user.');
+      }
+    },
+  };
+  --------------------------------------------------------------------------------
+
+File: ./src/commands/moderation/ban.js
+--------------------------------------------------------------------------------
+const {
+  ApplicationCommandOptionType,
+  PermissionFlagsBits,
+} = require('discord.js');
+
+module.exports = {
+  name: 'ban',
+  description: 'Bans a member from this server',
+  options: [
+    {
+      name: 'target',
+      description: 'The user you want to ban',
+      type: ApplicationCommandOptionType.User,
+      required: true,
+    },
+    {
+      name: 'reason',
+      description: 'Reason for banning',
+      type: ApplicationCommandOptionType.String,
+      required: false,
+    },
+  ],
+  permissionsRequired: [PermissionFlagsBits.BanMembers.valueOf()],
+  botPermissions: [PermissionFlagsBits.BanMembers.valueOf()],
+  callback: async (client, interaction) => {
+    const targetUser = interaction.options.getUser('target');
+    const reason =
+      interaction.options.getString('reason') || 'No reason provided';
+
+    await interaction.deferReply();
+
+    const targetMember = await interaction.guild.members
+      .fetch(targetUser.id)
+      .catch(() => null);
+
+    if (!targetMember) {
+      return interaction.editReply(
+        'That user does not exist in this server.'
+      );
+    }
+
+    if (targetMember.id === interaction.guild.ownerId) {
+      return interaction.editReply('You cannot ban the server owner.');
+    }
+
+    const targetRolePosition = targetMember.roles.highest.position;
+    const requestorRolePosition = interaction.member.roles.highest.position;
+    const botRolePosition = interaction.guild.members.me.roles.highest.position;
+
+    if (targetRolePosition >= requestorRolePosition) {
+      return interaction.editReply(
+        'You cannot ban this user as they have a higher or equal role.'
+      );
+    }
+
+    if (targetRolePosition >= botRolePosition) {
+      return interaction.editReply(
+        'I cannot ban this user as they have a higher or equal role.'
+      );
+    }
+
+    try {
+      await targetMember.ban({ reason });
+      interaction.editReply(
+        `User ${targetUser.tag} was banned. Reason: ${reason}`
+      );
+    } catch (error) {
+      console.error('Error banning user:', error);
+      interaction.editReply('There was an error banning this user.');
+    }
+  },
+};
+--------------------------------------------------------------------------------
+
+File: ./src/events/ready/consoleLog.js
+--------------------------------------------------------------------------------
+const { ActivityType } = require('discord.js');
+
+module.exports = (client) => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  const statusArray = [
+    {
+      name: 'Viendo fotos...',
+      type: ActivityType.Watching,
+      url: 'https://jrmgraphy.com',
+    },
+    {
+      name: 'Jugando con amigos',
+      type: ActivityType.Playing,
+    },
+    {
+      name: 'Escuchando música',
+      type: ActivityType.Listening,
+    },
+    // Add more statuses if needed
+  ];
+
+  let index = 0;
+  function updateStatus() {
+    const status = statusArray[index];
+    client.user.setActivity(status);
+    index = (index + 1) % statusArray.length;
+  }
+
+  updateStatus();
+  setInterval(updateStatus, 10000); // Update every 10 seconds
+};
+--------------------------------------------------------------------------------
+
+File: ./src/events/interactionCreate/handleCommands.js
+--------------------------------------------------------------------------------
+const { devs, testServer } = require('../../../config.json');
+const getLocalCommands = require('../../utils/getLocalCommands');
+
+module.exports = async (client, interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const localCommands = getLocalCommands();
+
+  try {
+    const commandObject = localCommands.find(
+      (cmd) => cmd.name === interaction.commandName
+    );
+
+    if (!commandObject) return;
+
+    // Developer-only commands
+    if (commandObject.devOnly) {
+      if (!devs.includes(interaction.member.id)) {
+        interaction.reply({
+          content: 'Only developers can run this command.',
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
+    // Test server-only commands
+    if (commandObject.testOnly) {
+      if (interaction.guild.id !== testServer) {
+        interaction.reply({
+          content: 'This command cannot be run in this server.',
+          ephemeral: true,
+        });
+        return;
+      }
+    }
+
+    // User permissions
+    if (commandObject.permissionsRequired?.length) {
+      for (const permission of commandObject.permissionsRequired) {
+        if (!interaction.member.permissions.has(permission)) {
+          interaction.reply({
+            content: "You don't have the required permissions.",
+            ephemeral: true,
+          });
+          return;
+        }
+      }
+    }
+
+    // Bot permissions
+    if (commandObject.botPermissions?.length) {
+      const bot = interaction.guild.members.me;
+      for (const permission of commandObject.botPermissions) {
+        if (!bot.permissions.has(permission)) {
+          interaction.reply({
+            content: "I don't have the required permissions.",
+            ephemeral: true,
+          });
+          return;
+        }
+      }
+    }
+
+    await commandObject.callback(client, interaction);
+  } catch (error) {
+    console.error(`Error executing command: ${error}`);
+  }
+};
+--------------------------------------------------------------------------------
+
+File: ./src/events/messageCreate/giveUserXP.js
+--------------------------------------------------------------------------------
+const Level = require('../../models/level');
+const calculateLevelXP = require('../../utils/calculateLevelXP');
+
+const cooldowns = new Set();
+
+module.exports = async (client, message) => {
+  if (!message.guild || message.author.bot || cooldowns.has(message.author.id))
+    return;
+
+  cooldowns.add(message.author.id);
+  setTimeout(() => cooldowns.delete(message.author.id), 60000); // 60 seconds cooldown
+
+  const xpToGive = Math.floor(Math.random() * 11) + 5; // XP between 5 and 15
+  const query = { userId: message.author.id, guildId: message.guild.id };
+
+  try {
+    let level = await Level.findOne(query);
+
+    if (level) {
+      level.xp += xpToGive;
+
+      if (level.xp >= calculateLevelXP(level.level)) {
+        level.xp = 0;
+        level.level += 1;
+        message.channel.send(
+          `${message.member} has leveled up to level ${level.level}!`
+        );
+      }
+
+      await level.save();
+    } else {
+      const newLevel = new Level({
+        userId: message.author.id,
+        guildId: message.guild.id,
+        xp: xpToGive,
+      });
+
+      await newLevel.save();
+    }
+  } catch (error) {
+    console.error('Error updating XP:', error);
+  }
+};
+--------------------------------------------------------------------------------
+
+File: ./src/handlers/eventHandler.js
+--------------------------------------------------------------------------------
+const path = require('path');
+const getAllFiles = require('../utils/getAllFiles');
+
+module.exports = (client) => {
+  const eventFolders = getAllFiles(
+    path.join(__dirname, '..', 'events'),
+    true
+  );
+
+  for (const eventFolder of eventFolders) {
+    const eventFiles = getAllFiles(eventFolder);
+    eventFiles.sort((a, b) => a > b);
+    const eventName = path.basename(eventFolder);
+
+    client.on(eventName, async (...args) => {
+      for (const eventFile of eventFiles) {
+        const eventFunction = require(eventFile);
+        try {
+          await eventFunction(client, ...args);
+        } catch (error) {
+          console.error(`Error in event ${eventName}:`, error);
+        }
+      }
+    });
+  }
+};
+--------------------------------------------------------------------------------
+

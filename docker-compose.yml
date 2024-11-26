@@ -1,0 +1,31 @@
+version: '3'
+
+services:
+  discordbot:
+    build: .
+    container_name: discordbot
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - mongodb
+    volumes:
+      - .:/app
+      - /app/node_modules # Ensures container's node_modules aren't overwritten by host
+    networks:
+      - botnet
+
+  mongodb:
+    image: mongo:6.0
+    container_name: mongodb
+    restart: always
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - botnet
+
+volumes:
+  mongodb_data:
+
+networks:
+  botnet:
